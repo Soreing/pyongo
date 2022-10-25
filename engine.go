@@ -122,10 +122,10 @@ func (e *Engine) listen(ch <-chan amqp.Delivery) {
 		case msg, active = <-ch:
 			if active {
 				e.events.Add(1)
-				go func() {
+				go func(msg amqp.Delivery) {
 					defer e.events.Done()
 					e.handle(msg)
-				}()
+				}(msg)
 			} else {
 				e.logger.Warn("channel closed")
 			}
