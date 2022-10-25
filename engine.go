@@ -77,7 +77,7 @@ func (e *Engine) Submit(msg amqp.Delivery) error {
 }
 
 // Runs the engine for a channel supplying messages
-func (e *Engine) Run(ch chan amqp.Delivery) {
+func (e *Engine) Run(ch <-chan amqp.Delivery) {
 	e.logger.Info("starting handler")
 	e.process.Add(1)
 	go func() {
@@ -111,7 +111,7 @@ func (e *Engine) WaitOnEvents() {
 }
 
 // Listens on a channel and handles incoming messages
-func (e *Engine) listen(ch chan amqp.Delivery) {
+func (e *Engine) listen(ch <-chan amqp.Delivery) {
 	e.logger.Info("listening to channel")
 	var msg amqp.Delivery
 
