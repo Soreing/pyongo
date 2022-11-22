@@ -1,10 +1,12 @@
 package pyongo
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
 
+	"github.com/Soreing/grasp"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
 )
@@ -16,6 +18,7 @@ type Engine struct {
 	submits *sync.WaitGroup // Waitgroup for the number of manually submitted events
 	events  *sync.WaitGroup // Waitgroup for currently running handlers for events
 	closeCh chan bool       // Close channel for closing the engine
+	pool    *grasp.Pool     // Handler goroutine pool
 
 	hndl    *Handler           // Handler root of the engine that routes events
 	mods    []KeyModFunc       // Key modifier functions that transform the routing key
@@ -28,10 +31,10 @@ type Engine struct {
 
 // Creates a new engine with a handler
 func New(
-	dropAck bool,
+	opt *Options,
 	lgr *zap.Logger,
 ) *Engine {
-	return &Engine{
+	eng := &Engine{
 		process: &sync.WaitGroup{},
 		submits: &sync.WaitGroup{},
 		events:  &sync.WaitGroup{},
@@ -40,9 +43,17 @@ func New(
 		hndl:    NewHandler(),
 		dropFnc: func(ctx *Context) {},
 		discard: false,
-		dropAck: dropAck,
+		dropAck: opt.DropAck,
 		logger:  lgr,
 	}
+
+	eng.pool = grasp.NewPool(opt.ThreadLimit, opt.ThreadExpiry,
+		func() grasp.Poolable {
+			return NewThread(eng)
+		},
+	)
+
+	return eng
 }
 
 // Sets the function to call when a message is dropped
@@ -100,6 +111,7 @@ func (e *Engine) Close() {
 	e.process.Wait()
 	e.submits.Wait()
 	e.events.Wait()
+	e.pool.Close()
 }
 
 // Waits for all the events being handled to finish
@@ -121,11 +133,17 @@ func (e *Engine) listen(ch <-chan amqp.Delivery) {
 			e.logger.Info("closing listener")
 		case msg, active = <-ch:
 			if active {
-				e.events.Add(1)
-				go func(msg amqp.Delivery) {
-					defer e.events.Done()
-					e.handle(msg)
-				}(msg)
+				val, done, err := e.pool.Acquire(context.Background())
+				if err != nil {
+					e.logger.Error("failed to acquire thread")
+					//msg.Nack(false)
+				} else if thr, ok := val.(*Thread); !ok {
+					e.logger.Error("pool valie is not a thread")
+					//msg.Nack(false)
+				} else {
+					e.events.Add(1)
+					thr.src <- poolMsg{msg, done}
+				}
 			} else {
 				e.logger.Warn("channel closed")
 			}
@@ -140,6 +158,7 @@ func (e *Engine) listen(ch <-chan amqp.Delivery) {
 // If there is a handler function, the context is ran, otherwise the
 // message is dropped with acknowledgement and drop function called
 func (e *Engine) handle(msg amqp.Delivery) {
+	defer e.events.Done()
 	for _, mod := range e.mods {
 		mod(&msg)
 	}
@@ -154,6 +173,11 @@ func (e *Engine) handle(msg amqp.Delivery) {
 		}
 		e.dropFnc(pctx)
 	}
+}
+
+// Returns the handler root for the engine
+func (e *Engine) Handler() *Handler {
+	return e.hndl
 }
 
 // ---------- pyongo.Handler masquerade functions---------- //

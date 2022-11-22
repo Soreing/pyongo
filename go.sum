@@ -1,3 +1,5 @@
+github.com/Soreing/grasp v0.1.1 h1:LQISm237Ulurq+FPGA0b+Uwf3Gqgo/rxVrgGpw5EHvM=
+github.com/Soreing/grasp v0.1.1/go.mod h1:nNM+lltC4Qcu+NRYF/3f5CUpaIoD4mRp1x4IIF1HXvY=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/kr/pretty v0.1.0/go.mod h1:dAy3ld7l9f0ibDNOQOHHMYYIIbhfbHSm3C4ZsoJORNo=
