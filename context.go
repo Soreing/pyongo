@@ -10,46 +10,48 @@ import (
 )
 
 type Mark struct {
-	name string
-	time time.Time
+	Tag  string
+	Time time.Time
 }
 
 type Context struct {
-	ctx context.Context
-	eng *Engine
-	msg amqp.Delivery
-
+	ctx  context.Context
+	msg  amqp.Delivery
 	mu   sync.RWMutex
 	keys map[string]any
 
-	mwIndex int
-	mwares  []HandlerFunc
+	fnIndex int
+	funcs   []func(ctx *Context)
 
 	marks  []Mark
 	Errors []error
 }
 
+// Creates a new context with an amqp message
 func NewContext(
-	eng *Engine,
 	msg amqp.Delivery,
 ) *Context {
 	return &Context{
-		eng:    eng,
-		msg:    msg,
-		ctx:    context.TODO(),
-		mwares: []HandlerFunc{},
-		marks:  []Mark{},
+		msg:   msg,
+		ctx:   context.TODO(),
+		funcs: []func(ctx *Context){},
+		marks: []Mark{},
 	}
 }
 
-func (c *Context) GetEngine() *Engine {
-	return c.eng
+// Adds functions to the stack.
+func (c *Context) addFunctions(mws []func(ctx *Context)) {
+	if len(mws) > 0 {
+		c.funcs = append(c.funcs, mws...)
+	}
 }
 
+// Gets the amqp message of the context.
 func (c *Context) GetMessage() amqp.Delivery {
 	return c.msg
 }
 
+// Sets a value in the context's store.
 func (c *Context) Set(key string, value any) {
 	c.mu.Lock()
 	if c.keys == nil {
@@ -60,6 +62,7 @@ func (c *Context) Set(key string, value any) {
 	c.mu.Unlock()
 }
 
+// Gets a value from the context's store and if it exists.
 func (c *Context) Get(key string) (value any, exists bool) {
 	c.mu.RLock()
 	value, exists = c.keys[key]
@@ -67,21 +70,25 @@ func (c *Context) Get(key string) (value any, exists bool) {
 	return
 }
 
+// Gets a value from the context's store, panics if does not exist.
 func (c *Context) MustGet(key string) any {
 	if value, exists := c.Get(key); exists {
 		return value
 	}
-	panic("Key \"" + key + "\" does not exist")
+	panic("key \"" + key + "\" does not exist")
 }
 
+// Adds a mark with a tag name and a timestamp on the context.
 func (c *Context) Mark(name string) {
 	c.marks = append(c.marks, Mark{name, time.Now()})
 }
 
+// Gets all the marks in the context.
 func (c *Context) GetMarks() []Mark {
 	return c.marks
 }
 
+// Adds an error to the context.
 func (c *Context) Error(err error) error {
 	if err == nil {
 		return fmt.Errorf("err is nil")
@@ -91,17 +98,15 @@ func (c *Context) Error(err error) error {
 	return nil
 }
 
-func (c *Context) AddMiddlewares(mws []HandlerFunc) {
-	if len(mws) > 0 {
-		c.mwares = append(c.mwares, mws...)
-	}
-}
-
+// Calls the next function in the function stack like middlewares. Panics if
+// there are no more functions on the stack.
 func (c *Context) Next() {
-	if c.mwIndex < len(c.mwares) {
-		idx := c.mwIndex
-		c.mwIndex++
-		c.mwares[idx](c)
+	if c.fnIndex < len(c.funcs) {
+		idx := c.fnIndex
+		c.fnIndex++
+		c.funcs[idx](c)
+	} else {
+		panic("function stack empty")
 	}
 }
 

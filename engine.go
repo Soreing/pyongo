@@ -2,7 +2,7 @@ package pyongo
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"strings"
 	"sync"
 
@@ -11,145 +11,222 @@ import (
 	"go.uber.org/zap"
 )
 
-type KeyModFunc func(*amqp.Delivery)
+const (
+	state_created = "created"
+	state_started = "started"
+	state_closed  = "closed"
+)
 
-type Engine struct {
-	process *sync.WaitGroup // Waitgroup to wait on before closing
-	submits *sync.WaitGroup // Waitgroup for the number of manually submitted events
-	events  *sync.WaitGroup // Waitgroup for currently running handlers for events
-	closeCh chan bool       // Close channel for closing the engine
-	pool    *grasp.Pool     // Handler goroutine pool
-
-	hndl    *Handler           // Handler root of the engine that routes events
-	mods    []KeyModFunc       // Key modifier functions that transform the routing key
-	dropFnc func(ctx *Context) // Function to execute when an message gets dropped (no handler)
-	discard bool               // If true, messages are read but not handled
-	dropAck bool               // If true, dropped messages are acknowledged
-
-	logger *zap.Logger
+type IEngine interface {
+	Handler
+	UseModifier(fn func(*amqp.Delivery))
+	AddSource(src <-chan amqp.Delivery) error
+	Start() error
+	Close() error
+	Submit(
+		ctx context.Context,
+		msg amqp.Delivery,
+	) error
 }
 
-// Creates a new engine with a handler
-func New(
-	opt *Options,
-	lgr *zap.Logger,
-) *Engine {
-	eng := &Engine{
-		process: &sync.WaitGroup{},
-		submits: &sync.WaitGroup{},
-		events:  &sync.WaitGroup{},
+type Engine struct {
+	sources *sync.WaitGroup // Sources being listened to
+	events  *sync.WaitGroup // Deliveries remaining to be handled
+	lock    *sync.RWMutex   // Lock to prevent access while closing
+	state   string          // State of the handler engine
 
-		closeCh: make(chan bool),
-		hndl:    NewHandler(),
-		dropFnc: func(ctx *Context) {},
-		discard: false,
-		dropAck: opt.DropAck,
-		logger:  lgr,
+	readSrc chan bool          // Condition channel to read from sources
+	msgBuff chan amqp.Delivery // Buffered delivery collection channel
+	pool    grasp.Pool         // Handler goroutine pool
+
+	hndl *handler               // Handler root of the engine that routes events
+	mods []func(*amqp.Delivery) // Modifier functions that transform the delivery
+
+	logger Logger
+}
+
+func New(opts ...*Options) *Engine {
+	opt := makeOptions(opts...)
+
+	eng := &Engine{
+		sources: &sync.WaitGroup{},
+		events:  &sync.WaitGroup{},
+		lock:    &sync.RWMutex{},
+		state:   state_created,
+
+		readSrc: make(chan bool),
+		msgBuff: make(chan amqp.Delivery, opt.buffSize),
+
+		hndl:   newHandler(),
+		mods:   []func(*amqp.Delivery){},
+		logger: opt.logger,
 	}
 
-	eng.pool = grasp.NewPool(opt.ThreadLimit, opt.ThreadExpiry,
+	eng.pool = grasp.NewPool(opt.threads, opt.idleTime,
 		func() grasp.Poolable {
-			return NewThread(eng)
+			return newThread(eng)
 		},
 	)
-
 	return eng
 }
 
-// Sets the function to call when a message is dropped
-func (e *Engine) SetDropFunction(fnc func(ctx *Context)) {
-	e.dropFnc = fnc
-}
-
-// Clears the function to call when a message gets dropped
-func (e *Engine) ClearDropFunction() {
-	e.dropFnc = func(ctx *Context) {}
-}
-
-// Adds a key modifier function that transforms the routing key
-// Modifier functions are executed in the order they were added
-func (e *Engine) AddKeyModifier(fn KeyModFunc) {
+// Adds a modifier function that transforms the delivery. Modifiers are
+// executed in the order they were added and can not be removed.
+func (e *Engine) UseModifier(fn func(*amqp.Delivery)) {
 	e.mods = append(e.mods, fn)
 }
 
-// Manually submits a message to be handled
-func (e *Engine) Submit(msg amqp.Delivery) error {
-	if e.discard {
-		e.logger.Error("failed to submit message")
-		return fmt.Errorf("handler is discarding messages")
+// Adds a listener to a channel, extracting deliveries and buffering them
+// to be routed and processed by handlers. Stops listening to the channel if
+// the cannel is closed or the handler is closed.
+func (e *Engine) AddSource(src <-chan amqp.Delivery) error {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+
+	if e.state == state_closed {
+		err := errors.New("handler is closed")
+		e.logger.Error("failed to add source", zap.Error(err))
+		return err
 	}
 
-	e.submits.Add(1)
+	e.sources.Add(1)
 	go func() {
-		e.submits.Done()
-		e.handle(msg)
+		defer e.sources.Done()
+		var msg amqp.Delivery
+		for active := true; active; {
+			select {
+			case _, active = <-e.readSrc:
+				/* handler closed */
+			case msg, active = <-src:
+				/* message received from the channel */
+				if active {
+					e.events.Add(1)
+					select {
+					case e.msgBuff <- msg:
+						/* message is submitted immediately */
+					default:
+						/* message buffer is full */
+						if e.logger != nil {
+							e.logger.Warn("message buffer is full")
+						}
+						e.msgBuff <- msg
+					}
+				}
+			}
+		}
+	}()
+
+	return nil
+}
+
+// Manually submits a delivery to the buffered channel to be routed and
+// processed by handlers. If the buffer is full, blocks until there is space
+// or the context is canceled
+func (e *Engine) Submit(
+	ctx context.Context,
+	msg amqp.Delivery,
+) error {
+	e.lock.RLock()
+	defer e.lock.RUnlock()
+
+	if e.state == state_closed {
+		err := errors.New("handler is closed")
+		e.logger.Error("failed to add source", zap.Error(err))
+		return err
+	}
+
+	e.events.Add(1)
+
+	select {
+	case e.msgBuff <- msg:
+		/* message is submitted immediately */
+	default:
+		/* message buffer is full */
+		if e.logger != nil {
+			e.logger.Warn("message buffer is full")
+		}
+		select {
+		case e.msgBuff <- msg:
+			/* message submitted */
+		case <-ctx.Done():
+			e.events.Done()
+			return errors.New("context cancaled")
+		}
+	}
+	return nil
+}
+
+// Starts processing deliveries from the buffered channel. Deliveries are
+// processed concurrently by threads acquired from a pool.
+func (e *Engine) Start() error {
+	e.logger.Info("attempting to start handler")
+	e.lock.Lock()
+	defer e.lock.Unlock()
+
+	e.logger.Info("starting handler")
+	if e.state != state_created {
+		err := errors.New("invalid state")
+		return err
+	}
+
+	e.state = state_started
+	go func() {
+		e.logger.Info("started consuming deliveries")
+		for delv := range e.msgBuff {
+			val, done, err := e.pool.Acquire(context.TODO())
+			if err != nil {
+				panic("failed to acquire thread")
+			} else if thr, ok := val.(*thread); !ok {
+				panic("resource is not a thread")
+			} else {
+				thr.src <- msg{delv, done}
+			}
+		}
+		e.logger.Info("stopped consuming deliveries")
 	}()
 	return nil
 }
 
-// Runs the engine for a channel supplying messages
-func (e *Engine) Run(ch <-chan amqp.Delivery) {
-	e.logger.Info("starting handler")
-	e.process.Add(1)
-	go func() {
-		defer e.process.Done()
-		e.listen(ch)
-	}()
-}
+// Closes the handler engine by detaching source channels to stop incoming
+// deliveries, waiting for deliveries to be handled and closing the handlers.
+func (e *Engine) Close() error {
+	e.logger.Info("attempting to close handler")
+	e.lock.Lock()
+	defer e.lock.Unlock()
 
-// Stops handling messages but keeps reading and discarding them
-func (e *Engine) Discard() {
-	e.logger.Info("putting the handler into discard mode")
-	e.discard = true
-}
+	e.logger.Info("closing handler")
+	e.state = state_closed
 
-// Stops reading from the channel and exit the handler
-// Waits for all operations to finish before returning
-func (e *Engine) Close() {
-	e.logger.Info("closing the handler")
-	close(e.closeCh)
-	e.process.Wait()
-	e.submits.Wait()
+	e.logger.Info("detaching source channels")
+	close(e.readSrc)
+	e.sources.Wait()
+
+	e.logger.Info("waiting for events")
 	e.events.Wait()
+
+	e.logger.Info("cleaning up resources")
+	close(e.msgBuff)
 	e.pool.Close()
+
+	e.logger.Info("handler closed")
+	return nil
 }
 
-// Waits for all the events being handled to finish
-func (e *Engine) WaitOnEvents() {
-	e.logger.Info("waiting on events to finish handling")
-	e.submits.Wait()
-	e.events.Wait()
-	e.logger.Info("events finished handling")
-}
+func (e *Engine) consume() {
+	e.logger.Info("started consuming deliveries")
 
-// Listens on a channel and handles incoming messages
-func (e *Engine) listen(ch <-chan amqp.Delivery) {
-	e.logger.Info("listening to channel")
-	var msg amqp.Delivery
-
-	for active := true; active; {
-		select {
-		case _, active = <-e.closeCh:
-			e.logger.Info("closing listener")
-		case msg, active = <-ch:
-			if active {
-				val, done, err := e.pool.Acquire(context.Background())
-				if err != nil {
-					e.logger.Error("failed to acquire thread")
-					//msg.Nack(false)
-				} else if thr, ok := val.(*Thread); !ok {
-					e.logger.Error("pool valie is not a thread")
-					//msg.Nack(false)
-				} else {
-					e.events.Add(1)
-					thr.src <- poolMsg{msg, done}
-				}
-			} else {
-				e.logger.Warn("channel closed")
-			}
+	for delv := range e.msgBuff {
+		val, done, err := e.pool.Acquire(context.TODO())
+		if err != nil {
+			panic("failed to acquire thread")
+		} else if thr, ok := val.(*thread); !ok {
+			panic("resource is not a thread")
+		} else {
+			thr.src <- msg{delv, done}
 		}
 	}
-	e.logger.Info("stopped listening to channel")
+
+	e.logger.Info("stopped consuming deliveries")
 }
 
 // Handles a message. The routing key of the message is ran through the
@@ -164,32 +241,31 @@ func (e *Engine) handle(msg amqp.Delivery) {
 	}
 
 	keys := strings.Split(msg.RoutingKey, ".")
-	pctx := NewContext(e, msg)
-	if err := e.hndl.Route(pctx, keys); err == nil {
-		pctx.Next()
-	} else {
-		if e.dropAck {
+	pctx := NewContext(msg)
+	if err := e.hndl.route(pctx, keys); err != nil {
+		pctx = NewContext(msg)
+		if err := e.hndl.global(pctx); err != nil {
+			e.logger.Warn(
+				"no handler found",
+				zap.String("key", msg.RoutingKey),
+				zap.Error(err))
 			msg.Ack(false)
+			return
 		}
-		e.dropFnc(pctx)
 	}
-}
-
-// Returns the handler root for the engine
-func (e *Engine) Handler() *Handler {
-	return e.hndl
+	pctx.Next()
 }
 
 // ---------- pyongo.Handler masquerade functions---------- //
 
-func (e *Engine) Use(fn HandlerFunc) {
+func (e *Engine) Use(fn func(ctx *Context)) {
 	e.hndl.Use(fn)
 }
 
-func (e *Engine) Group(name string) *Handler {
+func (e *Engine) Group(name string) Handler {
 	return e.hndl.Group(name)
 }
 
-func (e *Engine) Set(name string, fn HandlerFunc) {
+func (e *Engine) Set(name string, fn func(ctx *Context)) {
 	e.hndl.Set(name, fn)
 }

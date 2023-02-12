@@ -6,21 +6,24 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-type poolMsg struct {
+type msg struct {
 	msg  amqp.Delivery
 	done func()
 }
 
-type Thread struct {
+type thread struct {
 	eng *Engine
-	src chan poolMsg
+	src chan msg
 	wg  *sync.WaitGroup
 }
 
-func NewThread(eng *Engine) *Thread {
-	t := &Thread{
+// Create a new thread to process messages concurrently.
+// Each thread has a reference to the handler engine and waits on a channel to
+// get messages to process. Messages get handled by the engine's specifications.
+func newThread(eng *Engine) *thread {
+	t := &thread{
 		eng: eng,
-		src: make(chan poolMsg),
+		src: make(chan msg),
 		wg:  &sync.WaitGroup{},
 	}
 
@@ -28,7 +31,7 @@ func NewThread(eng *Engine) *Thread {
 	go func() {
 		defer t.wg.Done()
 
-		var pm poolMsg
+		var pm msg
 		for active := true; active; {
 			if pm, active = <-t.src; active {
 				t.eng.handle(pm.msg)
@@ -40,7 +43,8 @@ func NewThread(eng *Engine) *Thread {
 	return t
 }
 
-func (t *Thread) PoolRelease() {
+// Close the thread and wait for it.
+func (t *thread) PoolRelease() {
 	close(t.src)
 	t.wg.Wait()
 }
