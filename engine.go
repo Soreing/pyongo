@@ -262,6 +262,10 @@ func (e *Engine) Use(fn func(ctx *Context)) {
 	e.hndl.Use(fn)
 }
 
+func (e *Engine) Routes() []string {
+	return e.hndl.Routes()
+}
+
 func (e *Engine) Group(name string) Handler {
 	return e.hndl.Group(name)
 }

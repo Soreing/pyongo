@@ -5,6 +5,7 @@ import (
 )
 
 type Handler interface {
+	Routes() []string
 	Group(name string) Handler
 	Set(name string, fn func(ctx *Context))
 	Use(fn func(ctx *Context))
@@ -43,6 +44,34 @@ func (h *handler) Set(name string, fn func(ctx *Context)) {
 // order they were added to the handler. Middlewares can not be removed.
 func (h *handler) Use(fn func(ctx *Context)) {
 	h.mdws = append(h.mdws, fn)
+}
+
+func (h *handler) Routes() []string {
+	cnt := 0
+	h.countRoutes(&cnt)
+	lst := make([]string, cnt)
+	h.listRoutes("", lst[:0])
+	return lst
+}
+
+func (h *handler) countRoutes(cnt *int) {
+	for k, v := range h.hmap {
+		if v.fn != nil && k != "#" {
+			*cnt++
+		} else {
+			v.countRoutes(cnt)
+		}
+	}
+}
+
+func (h *handler) listRoutes(r string, lst []string) {
+	for k, v := range h.hmap {
+		if v.fn != nil && k != "#" {
+			lst = append(lst, r+k)
+		} else {
+			v.listRoutes(r+k+".", lst)
+		}
+	}
 }
 
 // Routes an event with a list of keys through the handler.
