@@ -34,6 +34,7 @@ type Engine struct {
 	events  *sync.WaitGroup // Deliveries remaining to be handled
 	lock    *sync.RWMutex   // Lock to prevent access while closing
 	state   string          // State of the handler engine
+	wait    chan error
 
 	readSrc chan bool          // Condition channel to read from sources
 	msgBuff chan amqp.Delivery // Buffered delivery collection channel
@@ -53,6 +54,7 @@ func New(opts ...*Options) *Engine {
 		events:  &sync.WaitGroup{},
 		lock:    &sync.RWMutex{},
 		state:   state_created,
+		wait:    make(chan error),
 
 		readSrc: make(chan bool),
 		msgBuff: make(chan amqp.Delivery, opt.buffSize),
@@ -207,9 +209,15 @@ func (e *Engine) Close() error {
 	e.logger.Info("cleaning up resources")
 	close(e.msgBuff)
 	e.pool.Close()
+	close(e.wait)
 
 	e.logger.Info("handler closed")
 	return nil
+}
+
+func (e *Engine) Wait() error {
+	err := <-e.wait
+	return err
 }
 
 func (e *Engine) consume() {
