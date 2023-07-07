@@ -49,8 +49,8 @@ func (h *handler) Use(fn func(ctx *Context)) {
 func (h *handler) Routes() []string {
 	cnt := 0
 	h.countRoutes(&cnt)
-	lst := make([]string, cnt)
-	h.listRoutes("", lst[:0])
+	lst, i := make([]string, cnt), 0
+	h.listRoutes("", lst, &i)
 	return lst
 }
 
@@ -64,12 +64,13 @@ func (h *handler) countRoutes(cnt *int) {
 	}
 }
 
-func (h *handler) listRoutes(r string, lst []string) {
+func (h *handler) listRoutes(r string, lst []string, i *int) {
 	for k, v := range h.hmap {
 		if v.fn != nil && k != "#" {
-			lst = append(lst, r+k)
+			lst[*i] = r + k
+			*i++
 		} else {
-			v.listRoutes(r+k+".", lst)
+			v.listRoutes(r+k+".", lst, i)
 		}
 	}
 }
